@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79]
+        shard: [9, 20, 30, 31, 33, 35, 36, 37, 52, 54, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,7 +87,7 @@ jobs:
           manifests = []
           for i in range(80):
               hits = glob.glob(f"downloaded/EXP-010-shard{i}/**/part_000000.bin", recursive=True)
-              assert hits, f"shard {i} part 未找到"
+              assert hits, f"shard {i} part 未找到（本轮只补采部分分片，其余分片 artifact 应已在仓）"
               ddir = os.path.dirname(hits[0])
               m = json.load(open(os.path.join(ddir, "manifest.json")))
               assert m["search_n"] == 16, f"shard {i} search_n={m['search_n']}"
@@ -241,7 +241,7 @@ jobs:
           pattern: EXP-010-model-*
           path: downloaded
           merge-multiple: false
-      - name: 汇总（regret 口径随教师变，只记不裁决；裁决=EXP-010b 闭环回主仓）
+      - name: 汇总（regret 口径随教师变，只记不裁决；裁决=EXP-010b 闭环）
         run: |
           python3 - <<'PY'
           import json, glob, os
@@ -256,13 +256,12 @@ jobs:
               results[tag] = (best, len(metrics))
               print(f"{tag}: best_regret={best:.1f} ({len(metrics)} ep)")
 
-          full = [v[0] for k, v in results.items()]
+          full = [v[0] for v in results.values()]
           mean = sum(full) / len(full)
           spread = max(full) - min(full)
           print(f"\n3-seed mean best_regret (NN 教师口径, sn16 @ 80k, ep400) = {mean:.1f}")
           print(f"种子散布 (max-min) = {spread:.1f}")
           print("⚠ 口径警告：教师评估器=NN，regret 与 008/009（手写教师）不可直接比；只看散布与早停健康性")
-          print("对照: EXP-008（手写教师 78k）= 90.6/96.6/81.6 均 89.6；EXP-009（手写教师 160k）≈ 82.5–83.0")
           lines = [f"{k}: {v[0]:.1f} ({v[1]} ep)" for k, v in results.items()] + [f"mean={mean:.1f}", f"spread={spread:.1f}"]
           open("SUMMARY.txt", "w").write("\n".join(lines) + "\n")
           PY
