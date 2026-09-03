@@ -9,15 +9,16 @@ env:
   MODEL_REPO: xf8410/uma-ramen-nn-lab
   MODEL_RUN_ID: "33716171772"
   MODEL_ARTIFACT: EXP-009-model-seed20260831
+  PREV_COLLECT_RUN_ID: "33771773228"
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        shard: [9, 20, 30, 31, 33, 35, 36, 37, 52, 54, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79]
+        shard: [9, 20, 30, 31, 33, 35, 36, 37, 52, 54, 59, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77, 78, 79]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,25 +75,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download 本跑 28 分片
+        uses: actions/download-artifact@v4
         with:
           pattern: EXP-010-shard*
-          path: downloaded
+          path: downloaded_cur
+          merge-multiple: false
+      - name: Download 前跑 52 分片（run 33771773228）
+        uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-010-shard*
+          path: downloaded_prev
+          repository: xf8410/uma-ramen-nn-lab-exp010
+          run-id: ${{ env.PREV_COLLECT_RUN_ID }}
+          github-token: ${{ github.token }}
           merge-multiple: false
       - name: 合并 80 分片（80k，区间 [i*1000,(i+1)*1000)）
         run: |
           python3 - <<'PY'
           import json, glob, os, shutil
 
+          found = {}
+          for root in ("downloaded_cur", "downloaded_prev"):
+              for d in sorted(glob.glob(f"{root}/EXP-010-shard*")):
+                  tag = os.path.basename(d)
+                  assert tag.startswith("EXP-010-shard"), tag
+                  shard = int(tag[len("EXP-010-shard"):])
+                  assert shard not in found, f"分片 {shard} 在两轮跑中重复出现"
+                  found[shard] = d
+          missing = [i for i in range(80) if i not in found]
+          assert not missing, f"缺分片: {missing}（应有 0-79 共 80 个）"
+
           manifests = []
           for i in range(80):
-              hits = glob.glob(f"downloaded/EXP-010-shard{i}/**/part_000000.bin", recursive=True)
-              assert hits, f"shard {i} part 未找到（本轮只补采部分分片，其余分片 artifact 应已在仓）"
-              ddir = os.path.dirname(hits[0])
-              m = json.load(open(os.path.join(ddir, "manifest.json")))
+              ddir = found[i]
+              hits = glob.glob(f"{ddir}/**/part_000000.bin", recursive=True)
+              assert hits, f"shard {i} part 未找到"
+              pdir = os.path.dirname(hits[0])
+              m = json.load(open(os.path.join(pdir, "manifest.json")))
               assert m["search_n"] == 16, f"shard {i} search_n={m['search_n']}"
               assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"shard {i} git {m['git_commit']}"
-              m["_dir"] = ddir
+              m["_dir"] = pdir
               manifests.append(m)
 
           base = manifests[0]
@@ -112,7 +135,7 @@ jobs:
 
           merged = {**base, "index_start": 0, "index_end": 80000, "parts": parts, "accepted": total,
                     "skipped_uncaptured": sum(m["skipped_uncaptured"] for m in manifests),
-                    "note": "merged from 80 matrix shards (EXP-010 selfdistill-v4, teacher=RamenNnTrainer 009b champion 66734.8, sn16, 80k)"}
+                    "note": "merged from 80 matrix shards across 2 runs (EXP-010 selfdistill-v4, teacher=RamenNnTrainer 009b champion 66734.8, sn16, 80k)"}
           merged.pop("_dir", None)
           json.dump(merged, open("dataset/manifest.json", "w"), ensure_ascii=False, indent=2)
           summary = f"accepted={total} skipped={merged['skipped_uncaptured']} parts={gidx} recipe={base['recipe_hash_fnv1a64']}"
