@@ -1,0 +1,96 @@
+name: EXP-010 自蒸馏 v4 冒烟（NN 教师 × sn16 × CHUNK=20 × manifest + 双跑逐位一致）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  # 009 训练 run 的模型 artifact（41MB：best.pt + model.onnx + model.onnx.json + metrics）
+  # ⚠ 不是 009b 的 CSV artifact——首烟红过一次，引用已修正
+  MODEL_REPO: xf8410/uma-ramen-nn-lab
+  MODEL_RUN_ID: "33716171772"
+  MODEL_ARTIFACT: EXP-009-model-seed20260831
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-010 patch（关联类型 cfg 双分支 + Send/Sync）
+        run: python3 lab/experiments/EXP-010-selfdistill-v4/patch_exp010.py
+      - name: Patch 自检
+        run: |
+          grep -n 'type RolloutTrainer = crate::trainer::RamenNnTrainer;' crates/umasim/src/search/searchable.rs
+          grep -n 'RamenNnTrainer::load' crates/umasim/src/search/searchable.rs
+          grep -n 'unsafe impl Sync for RamenNnTrainer' crates/umasim/src/trainer/ramen_nn_trainer.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp010-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp010-${{ runner.os }}-
+            lab-exp009-${{ runner.os }}-
+      - name: Download champion model（跨仓：主仓 run 33716171772）
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MODEL_ARTIFACT }}
+          path: models/champion
+          repository: ${{ env.MODEL_REPO }}
+          run-id: ${{ env.MODEL_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: 模型资产自检（定位 model.onnx，不依赖 artifact 内部层级）
+        run: |
+          find models/champion -type f | sort
+          ONNX=$(find models/champion -name model.onnx | head -1)
+          [ -n "$ONNX" ] || { echo "model.onnx 缺失"; exit 1; }
+          [ -f "$ONNX.json" ] || { echo "旁路 JSON 缺失: $ONNX.json"; exit 1; }
+          echo "RAMEN_NN_MODEL=$PWD/$ONNX" >> "$GITHUB_ENV"
+      - name: Smoke（CHUNK=20，index [0,20)）
+        run: bash lab/experiments/EXP-010-selfdistill-v4/run.sh 0 20
+      - name: 双跑逐位一致（Send/Sync 经验防线：同 index 两次采集 part 哈希必须相同）
+        run: |
+          cargo build --release --features onnx -p umasim --bin ramen_teacher_collect
+          ./target/release/ramen_teacher_collect --count 5 --start 900000 --search-n 16 \
+            --output-dir experiment_output/det_a --shard-size 256 >/dev/null 2>&1
+          ./target/release/ramen_teacher_collect --count 5 --start 900000 --search-n 16 \
+            --output-dir experiment_output/det_b --shard-size 256 >/dev/null 2>&1
+          HA=$(find experiment_output/det_a -name 'part_*.bin' -exec sha256sum {} + | sed 's|det_a/||' | sort | sha256sum)
+          HB=$(find experiment_output/det_b -name 'part_*.bin' -exec sha256sum {} + | sed 's|det_b/||' | sort | sha256sum)
+          echo "A=$HA"; echo "B=$HB"
+          [ "$HA" = "$HB" ] || { echo "DETERMINISM FAIL: NN 教师并行 rollout 逐位不一致（tract 共享竞态坐实，需转 thread_local 方案）"; exit 1; }
+          echo "DETERMINISM OK"
+      - name: Manifest 断言
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open("experiment_output/shard_0/manifest.json"))
+          assert m["search_n"] == 16, f"search_n={m['search_n']}，应为 16"
+          assert m["index_start"] == 0 and m["index_end"] == 20, f"区间错: [{m['index_start']},{m['index_end']})"
+          assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"git {m['git_commit']}"
+          assert m["finished_at"], "未完成"
+          print("MANIFEST OK:", json.dumps({k: m.get(k) for k in ("search_n","index_start","index_end","accepted","skipped_uncaptured","recipe_hash_fnv1a64")}, ensure_ascii=False))
+          PY
+      - name: Upload smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-smoke-shard0
+          path: experiment_output/env_shard_0.txt
+          retention-days: 7
+          if-no-files-found: error
