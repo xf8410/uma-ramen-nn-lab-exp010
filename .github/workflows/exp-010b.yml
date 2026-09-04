@@ -26,9 +26,9 @@ jobs:
           - id: hw-champion
             trainer: handwritten
             variant: g2420-o2150-o3150-g3160-cook60
-          - { id: nn010-0830, seed: "20260830" }
-          - { id: nn010-0831, seed: "20260831" }
-          - { id: nn010-0832, seed: "20260832" }
+          - { id: nn010-0830, trainer: nn, seed: "20260830" }
+          - { id: nn010-0831, trainer: nn, seed: "20260831" }
+          - { id: nn010-0832, trainer: nn, seed: "20260832" }
     steps:
       - uses: actions/checkout@v4
         with:
