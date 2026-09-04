@@ -1,0 +1,245 @@
+name: EXP-010 自蒸馏 v4 76k（76 片合并训练；缺 9/20/30/67 白名单）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  MODEL_REPO: xf8410/uma-ramen-nn-lab
+  MODEL_RUN_ID: "33716171772"
+  MODEL_ARTIFACT: EXP-009-model-seed20260831
+  PREV_COLLECT_RUN_ID: "33771773228"
+  TOPUP_COLLECT_RUN_ID: "33832148795"
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Download 前跑 52 分片（run 33771773228）
+        uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-010-shard*
+          path: downloaded_prev
+          repository: xf8410/uma-ramen-nn-lab-exp010
+          run-id: ${{ env.PREV_COLLECT_RUN_ID }}
+          github-token: ${{ github.token }}
+          merge-multiple: false
+      - name: Download 补采 24 分片（run 33832148795）
+        uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-010-shard*
+          path: downloaded_topup
+          repository: xf8410/uma-ramen-nn-lab-exp010
+          run-id: ${{ env.TOPUP_COLLECT_RUN_ID }}
+          github-token: ${{ github.token }}
+          merge-multiple: false
+      - name: 合并 76 分片（76k；缺 9/20/30/67 白名单，其余缺即失败）
+        run: |
+          python3 - <<'PY'
+          import json, glob, os, shutil
+
+          ALLOW_MISSING = {9, 20, 30, 67}
+          found = {}
+          for root in ("downloaded_prev", "downloaded_topup"):
+              for d in sorted(glob.glob(f"{root}/EXP-010-shard*")):
+                  tag = os.path.basename(d)
+                  assert tag.startswith("EXP-010-shard"), tag
+                  shard = int(tag[len("EXP-010-shard"):])
+                  assert shard not in found, f"分片 {shard} 在两轮跑中重复出现"
+                  found[shard] = d
+          missing = [i for i in range(80) if i not in found]
+          assert set(missing) == ALLOW_MISSING, f"缺分片 {sorted(missing)} != 白名单 {sorted(ALLOW_MISSING)}"
+          assert len(found) == 76, f"应有 76 片，实得 {len(found)}"
+
+          manifests = []
+          for i in sorted(found):
+              ddir = found[i]
+              hits = glob.glob(f"{ddir}/**/part_000000.bin", recursive=True)
+              assert hits, f"shard {i} part 未找到"
+              pdir = os.path.dirname(hits[0])
+              m = json.load(open(os.path.join(pdir, "manifest.json")))
+              assert m["search_n"] == 16, f"shard {i} search_n={m['search_n']}"
+              assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"shard {i} git {m['git_commit']}"
+              m["_dir"] = pdir
+              manifests.append(m)
+
+          base = manifests[0]
+          os.makedirs("dataset", exist_ok=True)
+          parts, gidx, total = [], 0, 0
+          for m in manifests:
+              i = m["index_start"] // 1000
+              s, e = i * 1000, (i + 1) * 1000
+              assert m["index_start"] == s and m["index_end"] == e, f"shard {i} 区间错: [{m['index_start']},{m['index_end']})"
+              assert m["finished_at"], f"shard {i} 未完成"
+              assert m["recipe_hash_fnv1a64"] == base["recipe_hash_fnv1a64"], f"shard {i} 配方不一致"
+              for p in m["parts"]:
+                  shutil.copy(os.path.join(m["_dir"], p["name"]), f"dataset/part_{gidx:06d}.bin")
+                  parts.append({**p, "name": f"part_{gidx:06d}.bin"})
+                  gidx += 1
+              total += m["accepted"]
+              print(f"shard {i}: accepted={m['accepted']} skipped={m['skipped_uncaptured']}")
+
+          merged = {**base, "index_start": 0, "index_end": 76000, "parts": parts, "accepted": total,
+                    "skipped_uncaptured": sum(m["skipped_uncaptured"] for m in manifests),
+                    "note": "merged from 76/80 matrix shards across 2 runs (EXP-010 selfdistill-v4, teacher=009b champion 66734.8, sn16, 76k); shards 9,20,30,67 missing (timeout, whitelisted)"}
+          merged.pop("_dir", None)
+          json.dump(merged, open("dataset/manifest.json", "w"), ensure_ascii=False, indent=2)
+          summary = f"accepted={total} skipped={merged['skipped_uncaptured']} parts={gidx} recipe={base['recipe_hash_fnv1a64']} shards=76/80(missing 9,20,30,67)"
+          print("MERGED:", summary)
+          open("dataset/SUMMARY.txt", "w").write(summary + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-dataset-76k
+          path: dataset/
+          retention-days: 30
+          if-no-files-found: error
+
+  convert:
+    needs: assemble
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Apply EXP-010 patch（convert 不采集，但保持树一致）
+        run: python3 lab/experiments/EXP-010-selfdistill-v4/patch_exp010.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp010-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp010-${{ runner.os }}-
+            lab-exp009-${{ runner.os }}-
+      - name: Download EXP-010 dataset (76k)
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-010-dataset-76k
+          path: training_data/exp010_merged_76k
+      - name: Build ramen_export_npy（无 onnx，验证 cfg 分支可编译）
+        run: cargo build --release -p umasim --bin ramen_export_npy
+      - name: Export npy (--raw)
+        run: ./target/release/ramen_export_npy --input training_data/exp010_merged_76k --output-dir training_data/npy_v4_76k --raw
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
+      - name: Generate labels
+        run: python3 scripts/ramen_nn/labels.py --input training_data/npy_v4_76k --output training_data/labels_v4_76k
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-npy-labels-76k
+          path: |
+            training_data/npy_v4_76k
+            training_data/labels_v4_76k
+          retention-days: 30
+          if-no-files-found: error
+
+  train:
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: seed20260830, seed: "20260830", extra: "--epochs 400" }
+          - { id: seed20260831, seed: "20260831", extra: "--epochs 400" }
+          - { id: seed20260832, seed: "20260832", extra: "--epochs 400" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
+      - name: Download npy + labels (76k)
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-010-npy-labels-76k
+          path: training_data
+      - name: Train (${{ matrix.id }})
+        run: |
+          python3 scripts/ramen_nn/train.py \
+            --data training_data/npy_v4_76k \
+            --labels training_data/labels_v4_76k \
+            --output-dir saved_models/${{ matrix.id }} \
+            --seed ${{ matrix.seed }} \
+            --device cpu \
+            ${{ matrix.extra }}
+      - name: Export ONNX
+        run: |
+          python3 scripts/ramen_nn/export_onnx.py \
+            --checkpoint saved_models/${{ matrix.id }}/best.pt \
+            --output saved_models/${{ matrix.id }}/model.onnx
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-model-76k-${{ matrix.id }}
+          path: saved_models/${{ matrix.id }}
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-010-model-76k-*
+          path: downloaded
+          merge-multiple: false
+      - name: 汇总（regret 口径随教师变，只记不裁决；裁决=EXP-010b 闭环）
+        run: |
+          python3 - <<'PY'
+          import json, glob, os
+
+          results = {}
+          for d in sorted(glob.glob("downloaded/EXP-010-model-76k-*")):
+              tag = os.path.basename(d).replace("EXP-010-model-76k-", "")
+              mpath = f"{d}/metrics.jsonl"
+              assert os.path.exists(mpath), f"metrics.jsonl 缺失: {mpath}"
+              metrics = [json.loads(l) for l in open(mpath)]
+              best = min(rec["best_regret"] for rec in metrics)
+              results[tag] = (best, len(metrics))
+              print(f"{tag}: best_regret={best:.1f} ({len(metrics)} ep)")
+
+          full = [v[0] for v in results.values()]
+          mean = sum(full) / len(full)
+          spread = max(full) - min(full)
+          print(f"\n3-seed mean best_regret (NN 教师口径, sn16 @ 76k, ep400) = {mean:.1f}")
+          print(f"种子散布 (max-min) = {spread:.1f}")
+          print("⚠ 口径警告：教师评估器=NN，regret 与 008/009（手写教师）不可直接比；只看散布与早停健康性")
+          print("⚠ 76k≠80k：shards 9,20,30,67 缺（超时白名单），对照 fast52=52k")
+          lines = [f"{k}: {v[0]:.1f} ({v[1]} ep)" for k, v in results.items()] + [f"mean={mean:.1f}", f"spread={spread:.1f}"]
+          open("SUMMARY.txt", "w").write("\n".join(lines) + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-summary-76k
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
