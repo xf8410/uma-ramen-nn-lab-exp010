@@ -1,0 +1,188 @@
+name: EXP-010b 自蒸馏 v4 闭环裁决（76k×3种子 NN × 手写双口径）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  # 76k 训练 run（EXP-010 自蒸馏 v4 76k，PR#4 合并后点火）
+  TRAIN_RUN_ID: "33867540112"
+
+jobs:
+  # 5 组并行：手写默认 + 手写冠军 + 3 个 EXP-010 76k NN 种子
+  # 口径与 EXP-004/004b/008b/009b 完全一致：525 计划 × 8 局 = 4200 局/组，seed 61444，race_shield on，canonical
+  # 注意：本仓 main 无 lab/ 子树，patch 链来自主仓 xf8410/uma-ramen-nn-lab main
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: hw-default
+            trainer: handwritten
+            variant: base
+          - id: hw-champion
+            trainer: handwritten
+            variant: g2420-o2150-o3150-g3160-cook60
+          - { id: nn010-0830, seed: "20260830" }
+          - { id: nn010-0831, seed: "20260831" }
+          - { id: nn010-0832, seed: "20260832" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          repository: xf8410/uma-ramen-nn-lab
+          ref: main
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix patch 链（冠军变体 token 需要）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp010b-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            exp010b-${{ runner.os }}-
+            lab-exp010-${{ runner.os }}-
+      - name: Download model (NN 组，来自 76k 训练 run)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-010-model-76k-seed${{ matrix.seed }}
+          path: models/seed${{ matrix.seed }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.TRAIN_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Verify model files (NN 组)
+        if: matrix.trainer == 'nn'
+        run: |
+          ONNX=$(find models/seed${{ matrix.seed }} -name "model.onnx" | head -1)
+          [ -n "$ONNX" ] && [ -f "${ONNX}.json" ] || { echo "model.onnx 或旁路 JSON 缺失"; exit 1; }
+      - name: Build bench（feature onnx，NN 组需要）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp010b_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ./target/release/ramen_space_bench --trainer nn \
+              --model "models/seed${{ matrix.seed }}/model.onnx" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten \
+              --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010b-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # 配对裁决：手写默认（65438.2 应逐位复现）+ 手写冠军（65554.2 应逐位复现）双基线
+  # 判据（§0.4）：t>2 且 Δ>0 才判 NN 超该口径
+  # 口径警告（带上下文解读）：教师=009b 冠军，其标签经 EXP-010 sn16 自蒸馏采集——
+  # 模拟器 D1（region_bonus 误乘 PT）/D2（同回合吃面新档立即生效）两处偏差已实锤未修，
+  # 65438.2 基线本身也带同样偏差（同口径自洽，裁决仍有效），但绝对分与真实游戏存在未量化偏移
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-010b-*
+          path: downloaded
+          merge-multiple: false
+      - name: 双口径配对裁决（全列报告 + SUMMARY.txt 落盘）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math, os
+
+          def load(tag):
+              hits = glob.glob(f"downloaded/EXP-010b-{tag}/**/exp010b_{tag}.csv", recursive=True)
+              assert hits, f"缺 {tag} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          def stats(rows):
+              s = [float(r["score"]) for r in rows]
+              n = len(s)
+              mean = sum(s) / n
+              sd = (sum((x - mean) ** 2 for x in s) / (n - 1)) ** 0.5
+              return s, n, mean, sd / math.sqrt(n)
+
+          def paired(d):
+              m = sum(d) / len(d)
+              se = (sum((x - m) ** 2 for x in d) / (len(d) - 1)) ** 0.5 / math.sqrt(len(d))
+              return m, (m / se if se > 0 else 0.0)
+
+          base_rows = load("hw-default")
+          base_scores, n, base_mean, base_se = stats(base_rows)
+          seeds = [r["seed"] for r in base_rows]
+          base_fail = sum(r["free_race_ok"] == "0" for r in base_rows)
+          print(f"手写默认 (base): n={n} mean={base_mean:.1f} se={base_se:.1f} 自选未达标={base_fail}（锚点 65438.2 应逐位复现）")
+
+          ch_rows = load("hw-champion")
+          assert [r["seed"] for r in ch_rows] == seeds, "冠军臂 seed 流不一致"
+          ch_scores, _, ch_mean, ch_se = stats(ch_rows)
+          ch_fail = sum(r["free_race_ok"] == "0" for r in ch_rows)
+          cd, ct = paired([a - b for a, b in zip(ch_scores, base_scores)])
+          print(f"手写冠军 (g2420-o2150-o3150-g3160-cook60): mean={ch_mean:.1f} se={ch_se:.1f} 自选未达标={ch_fail}")
+          print(f"  vs 默认 配对 Δ={cd:+.1f} t={ct:+.2f}（锚点应复现 +116.1 t+5.91）")
+
+          lines = [
+              f"hw-default: mean={base_mean:.1f} se={base_se:.1f} fail={base_fail}",
+              f"hw-champion: mean={ch_mean:.1f} se={ch_se:.1f} fail={ch_fail} d_vs_default={cd:+.1f} t={ct:+.2f}",
+          ]
+
+          print(f"\n{'组':<14} {'均分':>8} {'Δ默认':>8} {'t':>7} | {'Δ冠军':>8} {'t':>7} | 判定")
+          nn_means = []
+          for tag in ["nn010-0830", "nn010-0831", "nn010-0832"]:
+              rows = load(tag)
+              assert len(rows) == n, f"{tag}: 行数 {len(rows)} != {n}"
+              assert [r["seed"] for r in rows] == seeds, f"{tag}: seed 列与基线不逐行一致，配对失效"
+              s, _, m, se = stats(rows)
+              nn_means.append((tag, m))
+              fail = sum(r["free_race_ok"] == "0" for r in rows)
+              d1 = [a - b for a, b in zip(s, base_scores)]
+              d2 = [a - b for a, b in zip(s, ch_scores)]
+              m1, t1 = paired(d1)
+              m2, t2 = paired(d2)
+              v1 = "超默认 ✅" if (t1 > 2 and m1 > 0) else "未超默认"
+              v2 = "超冠军 ✅" if (t2 > 2 and m2 > 0) else "未超冠军"
+              print(f"{tag:<14} {m:>8.1f} {m1:>+8.1f} {t1:>+7.2f} | {m2:>+8.1f} {t2:>+7.2f} | {v1} / {v2}")
+              lines.append(f"{tag}: mean={m:.1f} d_default={m1:+.1f} t={t1:+.2f} d_champ={m2:+.1f} t2={t2:+.2f} fail={fail} {v1}/{v2}")
+
+          nn_avg = sum(m for _, m in nn_means) / len(nn_means)
+          best = max(nn_means, key=lambda x: x[1])
+          print(f"\nNN 3 种子均值 = {nn_avg:.1f}（距 70000 = {70000 - nn_avg:+.1f}）；最好种子 {best[0]} = {best[1]:.1f}（距 70000 = {70000 - best[1]:+.1f}）")
+          print("历史链：gen1 −5516~−9514 → gen2 −1139~−613 → gen3 0832 +231(双口径) → gen4(009b) 0831=66734.8 纪录 → 本轮=gen5（自蒸馏 76k）")
+          print("口径警告：教师=009b 冠军(66734.8)，数据=EXP-010 sn16 自蒸馏 76k；模拟器 D1/D2 偏差带上下文（同口径自洽）")
+          lines.append(f"nn_mean={nn_avg:.1f} gap_to_70000={70000 - nn_avg:+.1f}; best={best[0]}={best[1]:.1f} gap={70000 - best[1]:+.1f}")
+          with open("SUMMARY.txt", "w") as f:
+              f.write("\n".join(lines) + "\n")
+          print("SUMMARY.txt 已写盘")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010b-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
