@@ -1,0 +1,51 @@
+name: EXP-012 教师闭环分（零采集零训练，只读 EXP-009 现成标签）
+
+# 目的：回答「教师（手写+sn64 搜索）自己到底能考多少分」——这个数决定 70000 目标
+# 在现有标签上是否可达，从而决定 EXP-011 那类训练侧实验还有没有必要继续。
+# 实现：下载 EXP-009-npy-labels（296MB，含 value_target[:,0]=scoreMean），
+#       按局分组取首样本 = 教师对该局最终分的事前估计。
+# 不采一行数据、不训一个模型、不碰上游 Rust。
+on:
+  workflow_dispatch:
+
+env:
+  LAB_REPO: xf8410/uma-ramen-nn-lab
+  # EXP-009 正式采集+训练 run（npy/labels 在此，保留至 2026-10-03）
+  DATA_RUN_ID: "33716171772"
+
+jobs:
+  teacher-score:
+    name: 教师分（读 009 标签）
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Download EXP-009 npy + labels
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-npy-labels
+          path: data
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: 落盘情况
+        run: |
+          echo "=== 目录树（前 60 行）==="
+          find data -maxdepth 3 | head -60
+          echo "=== 总大小 ==="
+          du -sh data
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numpy
+        run: pip install numpy
+      - name: 算教师闭环分
+        run: python3 lab/experiments/EXP-012-teacher-score/teacher_score.py data
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-012-teacher-score
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
