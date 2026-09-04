@@ -1,0 +1,170 @@
+name: EXP-011a 快线（只裁 ens3，零训练；不等 exp-011 的 6 个训练臂）
+
+# 为什么单独一条：ens3 是**零成本臂**（只把 EXP-009 三个现成模型合成一个集成 ONNX），
+# 却被 exp-011.yml 的 needs: train 挡在 ~4 小时之后。按"便宜的判决先跑"的规矩拆出来。
+# 与 exp-011 共用同一套脚本与同一 artifact 命名（EXP-011-bench-<id>），裁决口径完全一致。
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  LAB_REPO: xf8410/uma-ramen-nn-lab
+  DATA_RUN_ID: "33716171772"
+
+jobs:
+  prep3:
+    name: ens3（009 三模型仿射校正平均）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260830
+          path: members/seed20260830
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260831
+          path: members/seed20260831
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260832
+          path: members/seed20260832
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install numpy onnx onnxruntime
+      - name: 事实核对（各成员训了多少轮、归一化是否同坐标系）
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/inspect_metrics.py \
+            members/seed20260830 members/seed20260831 members/seed20260832
+      - name: 合成 ens3
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/compose_ensemble.py \
+            --output ens3/model.onnx \
+            --models members/seed20260830/model.onnx members/seed20260831/model.onnx members/seed20260832/model.onnx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-ens3
+          path: ens3/
+          retention-days: 30
+          if-no-files-found: error
+
+  bench:
+    name: bench (${{ matrix.id }})
+    needs: prep3
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: hw-default, trainer: handwritten, variant: base }
+          - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
+          - { id: ctrl-009-0831, trainer: nn, artifact: EXP-009-model-seed20260831, repo: xf8410/uma-ramen-nn-lab, run: "33716171772", onnx: model.onnx }
+          - { id: ens3, trainer: nn, artifact: EXP-011-ens3, onnx: model.onnx }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAB_REPO }}
+          ref: main
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix patch 链（冠军变体 token 需要）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp011-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            exp011-${{ runner.os }}-
+            exp010b-${{ runner.os }}-
+            lab-exp010-${{ runner.os }}-
+      - name: Download model (NN 组)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: models/${{ matrix.id }}
+          repository: ${{ matrix.repo || github.repository }}
+          run-id: ${{ matrix.run || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify model files (NN 组)
+        if: matrix.trainer == 'nn'
+        run: |
+          ONNX=$(find models/${{ matrix.id }} -name "${{ matrix.onnx }}" | head -1)
+          [ -n "$ONNX" ] && [ -f "${ONNX}.json" ] || { echo "缺 ${{ matrix.onnx }} 或其 sidecar"; exit 1; }
+      - name: Build bench（feature onnx）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp011_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ONNX=$(find models/${{ matrix.id }} -name "${{ matrix.onnx }}" | head -1)
+            ./target/release/ramen_space_bench --trainer nn --model "$ONNX" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten \
+              --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-bench-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    name: 闭环配对裁决（ens3）
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-011-bench-*
+          path: downloaded
+          merge-multiple: false
+      - name: 三基线配对裁决
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/verdict.py downloaded \
+            hw-default hw-champion ctrl-009-0831 ens3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011a-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
