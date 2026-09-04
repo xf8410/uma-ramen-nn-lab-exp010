@@ -1,0 +1,307 @@
+name: EXP-011 零采集训练侧实验（160k 现成标签：集成 / EMA / 更长日程）
+
+# 唯一变量 = 训练侧与模型合成，**不采一行新数据**（EXP-009 的 160k sn64 标签原样复用）。
+# 依据：EXP-010 自蒸馏判负（regret 变好但闭环 −1516），教训=只看闭环分；
+# 而 009 三种子闭环散布 1139 分（65595.5↔66734.8）说明「种子抽签」尚未收敛，
+# 集成/EMA 是零采集就能吃掉的方差。裁决口径 = EXP-011b 闭环（本 workflow 内置 bench）。
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  LAB_REPO: xf8410/uma-ramen-nn-lab
+  # EXP-009 正式采集+训练 run（160k npy/labels 与 3 个模型 artifact 均在此，保留至 10-03）
+  DATA_RUN_ID: "33716171772"
+  # 与 EXP-009 seed20260831 同一 train/val 划分（split-seed 决定样本身份）
+  SPLIT_SEED: "20260831"
+
+jobs:
+  # ---------- 零成本臂：把 009 三个现成模型合成一个集成模型 ----------
+  prep3:
+    name: ens3（009 三模型仿射校正平均）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Download EXP-009 三模型（逐个精确名，避免 pattern 误抓 sub12k 对照臂）
+        run: mkdir -p members
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260830
+          path: members/seed20260830
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260831
+          path: members/seed20260831
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-model-seed20260832
+          path: members/seed20260832
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install numpy onnx onnxruntime
+      - name: 事实核对（各成员训了多少轮、归一化是否同坐标系）
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/inspect_metrics.py \
+            members/seed20260830 members/seed20260831 members/seed20260832
+      - name: 合成 ens3
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/compose_ensemble.py \
+            --output ens3/model.onnx \
+            --models members/seed20260830/model.onnx members/seed20260831/model.onnx members/seed20260832/model.onnx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-ens3
+          path: ens3/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 训练臂：同划分、只变 init-seed（6 成员）+ 更长日程臂（1） ----------
+  train:
+    name: train (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # e1 额外挂两个 EMA（纯诊断，不改梯度）→ 同一 run 白送 ema1500/ema5000 两个臂
+          - { id: e1,   init: "1001", extra: "--ema-halflife-steps 1500 5000" }
+          - { id: e2,   init: "1002", extra: "" }
+          - { id: e3,   init: "1003", extra: "" }
+          - { id: e4,   init: "1004", extra: "" }
+          - { id: e5,   init: "1005", extra: "" }
+          - { id: e6,   init: "1006", extra: "" }
+          # 更长日程臂：不早停、精确截到 80000 步（≈567 轮，009 上限是 400 轮）
+          - { id: long, init: "1007", extra: "--no-early-stop --max-steps 80000" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
+      - name: Download EXP-009 npy + labels（160k，零采集）
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-009-npy-labels
+          path: training_data
+          repository: ${{ env.LAB_REPO }}
+          run-id: ${{ env.DATA_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Verify 数据到位
+        run: |
+          ls training_data/npy_v3/x.npy training_data/labels_v3/policy_target.npy
+          python3 -c "import numpy as np; print('样本数', np.load('training_data/npy_v3/index.npy', mmap_mode='r').shape)"
+      - name: Train（配方 = EXP-009 逐字一致，只把 split-seed 固定、变 init-seed）
+        run: |
+          python3 scripts/ramen_nn/train.py \
+            --data training_data/npy_v3 \
+            --labels training_data/labels_v3 \
+            --output-dir saved_models/${{ matrix.id }} \
+            --split-seed ${{ env.SPLIT_SEED }} --init-seed ${{ matrix.init }} \
+            --device cpu --epochs 400 ${{ matrix.extra }}
+      - name: Export ONNX（best + 若有 EMA）
+        run: |
+          python3 scripts/ramen_nn/export_onnx.py \
+            --checkpoint saved_models/${{ matrix.id }}/best.pt \
+            --output saved_models/${{ matrix.id }}/model.onnx
+          for ckpt in saved_models/${{ matrix.id }}/last_ema*.pt; do
+            [ -f "$ckpt" ] || continue
+            halflife=$(basename "$ckpt" .pt)
+            halflife=${halflife#last_ema}
+            python3 scripts/ramen_nn/export_onnx.py \
+              --checkpoint "$ckpt" \
+              --output "saved_models/${{ matrix.id }}/model-ema${halflife}.onnx"
+          done
+          ls -1 saved_models/${{ matrix.id }}
+      - name: 瘦身（artifact 只留 onnx + 元数据，.pt 不占账户存储配额）
+        run: rm -f saved_models/${{ matrix.id }}/*.pt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-model-${{ matrix.id }}
+          path: saved_models/${{ matrix.id }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 6 成员集成（同 split-seed → 同归一化，校正后平均） ----------
+  prep6:
+    name: ens6（6 个同划分新成员）
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-011-model-e*
+          path: members
+          merge-multiple: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install numpy onnx onnxruntime
+      - name: 校验 6 个成员齐备
+        run: |
+          for i in 1 2 3 4 5 6; do
+            [ -f "members/EXP-011-model-e${i}/model.onnx" ] || { echo "缺成员 e${i}"; exit 1; }
+          done
+          ls -1 members/
+      - name: 事实核对
+        run: python3 lab/experiments/EXP-011-zerocost/inspect_metrics.py members/EXP-011-model-e1
+      - name: 合成 ens6
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/compose_ensemble.py \
+            --output ens6/model.onnx \
+            --models \
+              members/EXP-011-model-e1/model.onnx \
+              members/EXP-011-model-e2/model.onnx \
+              members/EXP-011-model-e3/model.onnx \
+              members/EXP-011-model-e4/model.onnx \
+              members/EXP-011-model-e5/model.onnx \
+              members/EXP-011-model-e6/model.onnx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-ens6
+          path: ens6/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 闭环 bench：9 组同口径并行（4200 局/组，seed 61444） ----------
+  bench:
+    name: bench (${{ matrix.id }})
+    needs: [prep3, prep6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: hw-default, trainer: handwritten, variant: base }
+          - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
+          - { id: ctrl-009-0831, trainer: nn, artifact: EXP-009-model-seed20260831, repo: xf8410/uma-ramen-nn-lab, run: "33716171772", onnx: model.onnx }
+          - { id: e1, trainer: nn, artifact: EXP-011-model-e1, onnx: model.onnx }
+          - { id: ema1500, trainer: nn, artifact: EXP-011-model-e1, onnx: model-ema1500.onnx }
+          - { id: ema5000, trainer: nn, artifact: EXP-011-model-e1, onnx: model-ema5000.onnx }
+          - { id: long, trainer: nn, artifact: EXP-011-model-long, onnx: model.onnx }
+          - { id: ens3, trainer: nn, artifact: EXP-011-ens3, onnx: model.onnx }
+          - { id: ens6, trainer: nn, artifact: EXP-011-ens6, onnx: model.onnx }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAB_REPO }}
+          ref: main
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix patch 链（冠军变体 token 需要）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp011-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            exp011-${{ runner.os }}-
+            exp010b-${{ runner.os }}-
+            lab-exp010-${{ runner.os }}-
+      - name: Download model (NN 组)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: models/${{ matrix.id }}
+          repository: ${{ matrix.repo || github.repository }}
+          run-id: ${{ matrix.run || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify model files (NN 组)
+        if: matrix.trainer == 'nn'
+        run: |
+          ONNX=$(find models/${{ matrix.id }} -name "${{ matrix.onnx }}" | head -1)
+          [ -n "$ONNX" ] && [ -f "${ONNX}.json" ] || { echo "缺 ${{ matrix.onnx }} 或其 sidecar"; exit 1; }
+      - name: Build bench（feature onnx）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp011_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ONNX=$(find models/${{ matrix.id }} -name "${{ matrix.onnx }}" | head -1)
+            ./target/release/ramen_space_bench --trainer nn --model "$ONNX" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten \
+              --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-bench-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 配对裁决（唯一判据；regret 不参与） ----------
+  summary:
+    name: 闭环配对裁决
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-011-bench-*
+          path: downloaded
+          merge-multiple: false
+      - name: 三基线配对裁决
+        run: |
+          python3 lab/experiments/EXP-011-zerocost/verdict.py downloaded \
+            hw-default hw-champion ctrl-009-0831 e1 ema1500 ema5000 long ens3 ens6
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-011-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
